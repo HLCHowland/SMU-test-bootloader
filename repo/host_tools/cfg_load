@@ -1,0 +1,113 @@
+#!/usr/bin/python3 -u
+
+# 2022 eCTF
+# Configure Tool
+# Kyle Scaplen
+#
+# (c) 2022 The MITRE Corporation
+#
+# This source file is part of an example system for MITRE's 2022 Embedded System
+# CTF (eCTF). This code is being provided only for educational purposes for the
+# 2022 MITRE eCTF competition, and may not meet MITRE standards for quality.
+# Use this code at your own risk!
+
+import argparse
+import logging
+from pathlib import Path
+import socket
+import math
+import struct
+
+from util import (
+    MAX_CONFIG_SIZE,
+    print_banner,
+    send_packets,
+    RESP_OK,
+    CONFIGURATION_ROOT,
+    LOG_FORMAT,
+)
+from crypto import MAC_SIZE, NONCE_SIZE, PAGE_SIZE
+
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+log = logging.getLogger(Path(__file__).name)
+
+
+def load_configuration(socket_number: int, config_file: Path):
+    print_banner("SAFFIRe Configuration Tool")
+
+    log.info("Reading configuration file...")
+    raw_configuration = config_file.read_bytes()
+
+    # Init the variables
+    log.info("Getting relevant data and stats....")
+    mac, config = raw_configuration[:MAC_SIZE], raw_configuration[MAC_SIZE:]
+    raw_config_size = len(config) - NONCE_SIZE
+    num_page = math.ceil(raw_config_size / (PAGE_SIZE + MAC_SIZE))
+    actual_size = raw_config_size - (num_page * MAC_SIZE)
+
+    # Sanity checks
+    if actual_size > MAX_CONFIG_SIZE:
+        exit(1)
+
+    # Connect to the bootloader
+    log.info("Connecting socket...")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.connect(("saffire-net", socket_number))
+
+        # Send configure command
+        log.info("Sending configure command...")
+        sock.send(b"C")
+
+        # Receive bootloader acknowledgement
+        while sock.recv(1) != b"C":
+            pass
+
+        # Send the MAC
+        log.info("Sending the MAC...")
+        sock.send(mac)
+        response = sock.recv(1)
+
+        # Send the size
+        log.info("Sending the size...")
+        payload = struct.pack(">I", actual_size)
+        sock.send(payload)
+        response = sock.recv(1)
+        if response != RESP_OK:
+            exit(f"ERROR: Bootloader responded with {repr(response)}")
+
+        # Send packets. Works similiar to the firmware update process. See fw_update.
+        send_packets(sock, config)
+
+        log.info("Waiting for bootloader to perform MAC...")
+        response = sock.recv(1)
+        if response != RESP_OK:
+            exit(f"ERROR: Bootloader responded with {repr(response)}")
+
+        log.info("Firmware configured\n")
+
+
+def main():
+    # get arguments
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--socket",
+        help="Port number of the socket to connect the host to the bootloader.",
+        type=int,
+        required=True,
+    )
+    parser.add_argument(
+        "--config-file",
+        help="Name of the protected configuration to load.",
+        required=True,
+    )
+
+    args = parser.parse_args()
+
+    config_file = CONFIGURATION_ROOT / args.config_file
+
+    load_configuration(args.socket, config_file)
+
+
+if __name__ == "__main__":
+    main()

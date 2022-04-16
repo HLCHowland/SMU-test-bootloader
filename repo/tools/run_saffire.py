@@ -1,0 +1,989 @@
+# 2022 eCTF
+# SAFFIRe Run Interface
+# Jake Grycel
+#
+# (c) 2022 The MITRE Corporation
+#
+# This source file is part of an example system for MITRE's 2022 Embedded System
+# CTF (eCTF). This code is being provided only for educational purposes for the
+# 2022 MITRE eCTF competition, and may not meet MITRE standards for quality.
+# Use this code at your own risk!
+#
+# DO NOT CHANGE THIS FILE
+
+import time
+import argparse
+import logging
+import inspect
+import subprocess
+import asyncio
+
+from pathlib import Path
+
+import load_image
+import serial_socket_bridge
+
+
+log = logging.getLogger(Path(__file__).name)
+
+ROOT_PATH = Path(__file__, "..", "..").resolve()
+
+
+def make_dirs(dir_list):
+    for path in dir_list:
+        Path(path).mkdir(exist_ok=True)
+
+
+def clear_dir(d):
+    p = Path(d)
+    if p.exists():
+        for item in Path(d).iterdir():
+            if item.is_dir():
+                Path.rmdir(item)
+            else:
+                Path.unlink(item)
+
+
+def get_volume(sysname, volume):
+    return f"{sysname}-{volume}.vol"
+
+
+async def run_asyncio_subprocess(cmd, capture_stdout=False, capture_stderr=False):
+    stdout = None
+    stderr = None
+
+    # Only capture the output when not running in script mode
+    if __name__ != "__main__":
+        if capture_stdout:
+            stdout = asyncio.subprocess.PIPE
+        if capture_stderr:
+            stderr = asyncio.subprocess.PIPE
+
+    proc = await asyncio.create_subprocess_shell(' '.join(cmd), stdout=stdout, stderr=stderr)
+    await proc.wait()
+    return proc
+
+
+def run_subprocess_capture(cmd):
+    capture_output = False
+
+    # Only capture the output when not running in script mode
+    if __name__ != "__main__":
+        capture_output = True
+
+    proc = subprocess.run(cmd, capture_output=capture_output)
+    return proc
+
+
+def delete_release_message(args):
+    # Get Docker-managed volumes
+    msg_root = get_volume(args.sysname, "messages")
+
+    # Run host tools container and remove the file
+    cmd = [
+        "docker",
+        "run",
+        "-i",
+        "-v",
+        f"{msg_root}:/messages",
+        "alpine:3.12",
+        "rm",
+        "-f",
+        f"/messages/{args.boot_msg_file}"
+    ]
+    return subprocess.run(cmd)
+
+
+def get_release_message(args):
+    # Get Docker-managed volumes
+    msg_root = get_volume(args.sysname, "messages")
+
+    # Run host tools container and cat the file
+    cmd = [
+        "docker",
+        "run",
+        "-i",
+        "-v",
+        f"{msg_root}:/messages",
+        "alpine:3.12",
+        "cat",
+        f"/messages/{args.boot_msg_file}"
+    ]
+    return run_subprocess_capture(cmd)
+
+
+def kill_bootloader(sysname):
+    # Stop running bootloader containers
+    cmd = ["docker", "ps", "-q", "--filter", f"name={sysname}-bootloader"]
+    bl_container_ids = (
+        subprocess.run(cmd, capture_output=True).stdout.decode("latin-1").rstrip()
+    )
+    if bl_container_ids != "":
+        for cid in bl_container_ids.split("\n"):
+            cmd = ["docker", "kill", f"{cid}"]
+            subprocess.run(cmd)
+
+    # Remove stopped bootloader containers
+    cmd = ["docker", "ps", "-a", "-q", "--filter", f"name={sysname}-bootloader"]
+    bl_container_ids = (
+        subprocess.run(cmd, capture_output=True).stdout.decode("latin-1").rstrip()
+    )
+    if bl_container_ids != "":
+        for cid in bl_container_ids.split("\n"):
+            cmd = ["docker", "rm", f"{cid}"]
+            subprocess.run(cmd)
+
+
+def kill_system(args):
+    # Kill the bootloader
+    kill_bootloader(args.sysname)
+
+    # Stop running host_tools containers
+    cmd = ["docker", "ps", "-q", "--filter", f"ancestor={args.sysname}/host_tools"]
+    host_container_ids = (
+        subprocess.run(cmd, capture_output=True).stdout.decode("latin-1").rstrip()
+    )
+    if host_container_ids != "":
+        for cid in host_container_ids.split("\n"):
+            cmd = ["docker", "kill", f"{cid}"]
+            subprocess.run(cmd)
+
+    # Remove stopped host_tools containers
+    cmd = [
+        "docker",
+        "ps",
+        "-a",
+        "-q",
+        "--filter",
+        f"ancestor={args.sysname}/host_tools",
+    ]
+    host_container_ids = (
+        subprocess.run(cmd, capture_output=True).stdout.decode("latin-1").rstrip()
+    )
+    if host_container_ids != "":
+        for cid in host_container_ids.split("\n"):
+            cmd = ["docker", "rm", f"{cid}"]
+            subprocess.run(cmd)
+
+    log.info("All system containers stopped and removed")
+
+
+def build_system(args):
+    # Check for type
+    if args.physical:
+        parent = "alpine:3.12"
+        parent_sc = "alpine:3.12"
+    elif args.emulated:
+        parent = f"{args.base_image}:tiva"
+        parent_sc = f"{args.base_image}:tiva_sc"
+    else:
+        exit("build_system: Missing '--emulated' or '--physical'")
+
+    # Get Docker-managed volumes
+    secrets_root = get_volume(args.sysname, "secrets")
+
+    log.info("Removing system volumes (if they exist)")
+
+    # Remove the old secrets
+    cmd = ["docker", "volume", "rm", f"{secrets_root}"]
+    subprocess.run(cmd)
+
+    # Build host tools
+    cmd = [
+        "docker",
+        "build",
+        "--progress",
+        "plain",
+        f"{args.root_path}",
+        "-f",
+        f"{args.root_path}/dockerfiles/1_build_saffire.Dockerfile",
+        "-t",
+        f"{args.sysname}/host_tools",
+        "--build-arg",
+        f"OLDEST_VERSION={args.oldest_allowed_version}",
+    ]
+    # Choose whether to force a full container build
+    if args.no_cache:
+        cmd.append("--no-cache")
+
+    p1 = run_subprocess_capture(cmd)
+
+    # Build device
+    cmd = [
+        "docker",
+        "build",
+        "--progress",
+        "plain",
+        f"{args.root_path}",
+        "-f",
+        f"{args.root_path}/dockerfiles/2_create_device.Dockerfile",
+        "-t",
+        f"{args.sysname}/bootloader:base",
+        "--build-arg",
+        f"SYSNAME={args.sysname}",
+        "--build-arg",
+        f"PARENT={parent}",
+        "--build-arg",
+        f"EEPROM_SECRET={args.eeprom_secret}",
+    ]
+    p2 = run_subprocess_capture(cmd)
+
+    # Build device copy with side-channel emulator
+    cmd = [
+        "docker",
+        "build",
+        "--progress",
+        "plain",
+        f"{args.root_path}",
+        "-f",
+        f"{args.root_path}/dockerfiles/2_create_device.Dockerfile",
+        "-t",
+        f"{args.sysname}/bootloader:sc",
+        "--build-arg",
+        f"SYSNAME={args.sysname}",
+        "--build-arg",
+        f"PARENT={parent_sc}",
+        "--build-arg",
+        f"EEPROM_SECRET={args.eeprom_secret}",
+    ]
+    p3 = run_subprocess_capture(cmd)
+
+    # "docker volume rm <secrets volume>" was returning an error code when the volume didn't exist
+    # not going to check the returncode of this
+    return [p1, p2, p3]
+
+
+def load_emulated_device(args):
+    # Get Docker-managed volumes
+    flash_root = get_volume(args.sysname, "flash")
+    eeprom_root = get_volume(args.sysname, "eeprom")
+
+    log.info("Loading device")
+
+    cmd = [
+        "docker",
+        "run",
+        "-i",
+        "-v",
+        f"{flash_root}:/flash",
+        "-v",
+        f"{eeprom_root}:/eeprom",
+        "--name",
+        f"{args.sysname}-bootloader",
+        f"{args.sysname}/bootloader:base",
+        "/platform/emulator_load",
+        "--infile",
+        "/bootloader/phys_image.bin",
+    ]
+    subprocess.run(cmd)
+
+    log.info("Emulated device loaded")
+
+    # Kill the exited containers
+    log.info("Removing emulator container")
+    kill_bootloader(args.sysname)
+
+
+def load_physical_device(args):
+    # Copy bootloader physical image from device container
+    cmd = ["docker", "create", f"{args.sysname}/bootloader:base"]
+    container_id = (
+        subprocess.run(cmd, capture_output=True).stdout.decode("latin-1").rstrip()
+    )
+
+    cmd = [
+        "docker",
+        "cp",
+        f"{container_id}:bootloader/phys_image.bin",
+        f"{args.sysname}-bl_image.bin.deleteme",
+    ]
+    subprocess.run(cmd)
+
+    log.info(
+        "Copied image to load into physical device:"
+        f" {args.sysname}-bl_image.bin.deleteme"
+    )
+
+    # Copy bootloader ELF from device container
+    cmd = [
+        "docker",
+        "cp",
+        f"{container_id}:bootloader/bootloader.elf",
+        f"{args.sysname}-bootloader.elf.deleteme",
+    ]
+    subprocess.run(cmd)
+
+    log.info(f"Copied bootloader ELF: {args.sysname}-bootloader.elf.deleteme")
+
+    cmd = ["docker", "rm", "-v", f"{container_id}"]
+    subprocess.run(cmd)
+
+    if load_image.load(f"{args.sysname}-bl_image.bin.deleteme") != 0:
+        log.error("load_device: Physical device load failed")
+        raise RuntimeError("load_device: Physical device load failed")
+
+
+def load_device(args):
+
+    # Check for type
+    if args.emulated:
+        load_emulated_device(args)
+    elif args.physical:
+        load_physical_device(args)
+    else:
+        log.error("load_device: Missing '--emulated' or '--physical'")
+        raise RuntimeError("load_device called without specifying '--emulated' or '--physical'")
+    log.info("Loaded SAFFIRe bootloader into device")
+
+
+def launch_emulator(args, interactive=False, do_gdb=False, do_sc=False):
+
+    # Need abspath for local folder to mount as a Docker volume
+    sock_root = Path(args.sock_root).resolve()
+    make_dirs([sock_root])
+
+    # Get Docker-managed volumes
+    flash_root = get_volume(args.sysname, "flash")
+    eeprom_root = get_volume(args.sysname, "eeprom")
+
+    if interactive:
+        dock_opt = "-i"
+    else:
+        dock_opt = "-d"
+
+    if do_gdb:
+        gdb_arg = 1
+    else:
+        gdb_arg = 0
+
+    if do_sc:
+        tag = "sc"
+        sc_arg = 1
+    else:
+        tag = "base"
+        sc_arg = 0
+
+    log.info("Starting emulator")
+
+    cmd = [
+        "docker",
+        "run",
+        f"{dock_opt}",
+        "-p",
+        f"{args.uart_sock}:{args.uart_sock}",
+        "--add-host=host.docker.internal:host-gateway",
+        "-v",
+        f"{sock_root}:/external_socks",
+        "-v",
+        f"{flash_root}:/flash",
+        "-v",
+        f"{eeprom_root}:/eeprom",
+        "--name",
+        f"{args.sysname}-bootloader",
+        f"{args.sysname}/bootloader:{tag}",
+        "sh",
+        "/platform/launch_platform.sh",
+        "--uart_sock",
+        f"{args.uart_sock}",
+        "--side-channel",
+        f"{sc_arg}",
+        "--gdb",
+        f"{gdb_arg}",
+    ]
+    subprocess.run(cmd)
+    # Wait for a few seconds
+    time.sleep(2)
+
+    if do_gdb:
+        # Copy bootloader.elf from the bootloader container to the local filesystem
+        cmd = ["docker", "create", f"{args.sysname}/bootloader:base"]
+        container_id = (
+            subprocess.run(cmd, capture_output=True).stdout.decode("latin-1").rstrip()
+        )
+
+        cmd = [
+            "docker",
+            "cp",
+            f"{container_id}:bootloader/bootloader.elf",
+            f"{args.sysname}-bootloader.elf.deleteme",
+        ]
+        subprocess.run(cmd)
+
+        log.info(f"Copied bootloader ELF: {args.sysname}-bootloader.elf.deleteme")
+
+        cmd = ["docker", "rm", "-v", f"{container_id}"]
+        subprocess.run(cmd)
+
+        cmd = [
+            "docker",
+            "run",
+            "-v",
+            f"{sock_root}:/external_socks",
+            f"{args.sysname}/bootloader:base",
+            "chmod",
+            "777",
+            "/external_socks/gdb.sock",
+        ]
+        subprocess.run(cmd)
+
+        print(
+            "Launched bootloader with GDB.\n"
+            "Run the following to attach to the GDB socket:\n"
+            f"gdb-multiarch {args.sysname}-bootloader.elf.deleteme"
+            f" -ex 'target remote {sock_root}/gdb.sock'"
+        )
+
+
+def launch_bootloader_bridge(args):
+    # Launch bridge (takes up terminal)
+    serial_socket_bridge.bridge(args.uart_sock, args.serial_port)
+
+
+def launch_bootloader(args):
+    # Check for type
+    if args.emulated:
+        if args.sock_root is None:
+            exit("launch_bootloader: Missing '--sock-root' for emulated flow")
+        launch_emulator(args)
+    elif args.physical:
+        if args.serial_port is None:
+            exit("launch_bootloader: Missing '--serial-port' for physical flow")
+        launch_bootloader_bridge(args)
+    else:
+        exit("launch_bootloader: Missing '--emulated' or '--physical'")
+
+
+def launch_bootloader_interactive(args):
+    if args.sock_root is None:
+        exit("launch_bootloader_interactive: Missing '--sock-root' for emulated flow")
+    launch_emulator(args, interactive=True)
+
+
+def launch_bootloader_gdb(args):
+    if args.sock_root is None:
+        exit("launch_bootloader_gdb: Missing '--sock-root' for emulated flow")
+    launch_emulator(args, do_gdb=True)
+
+
+def launch_bootloader_sc(args):
+    if args.sock_root is None:
+        exit("launch_bootloader_sc: Missing '--sock-root' for emulated flow")
+    launch_emulator(args, do_sc=True)
+
+
+async def fw_protect(args):
+    # Get Docker-managed volumes
+    secrets_root = get_volume(args.sysname, "secrets")
+
+    # Need abspath for local folder to mount as a Docker volume
+    fw_root = Path(args.fw_root).resolve()
+    make_dirs([fw_root])
+
+    cmd = [
+        "docker",
+        "run",
+        "-i",
+        "--add-host=host.docker.internal:host-gateway",
+        "-v",
+        f"{secrets_root}:/secrets",
+        "-v",
+        f"{fw_root}:/firmware",
+        f"{args.sysname}/host_tools",
+        "/host_tools/fw_protect",
+        "--firmware",
+        f"{args.raw_fw_file}",
+        "--version",
+        f"{args.fw_version}",
+        "--release-message",
+        f'"{args.fw_message}"',
+        "--output-file",
+        f"{args.protected_fw_file}",
+    ]
+    result = await run_asyncio_subprocess(cmd, capture_stderr=True)
+    return result
+
+
+async def cfg_protect(args):
+    # Get Docker-managed volumes
+    secrets_root = get_volume(args.sysname, "secrets")
+
+    # Need abspath for local folder to mount as a Docker volume
+    cfg_root = Path(args.cfg_root).resolve()
+    make_dirs([cfg_root])
+
+    cmd = [
+        "docker",
+        "run",
+        "-i",
+        "-v",
+        f"{secrets_root}:/secrets",
+        "-v",
+        f"{cfg_root}:/configuration",
+        f"{args.sysname}/host_tools",
+        "/host_tools/cfg_protect",
+        "--input-file",
+        f"{args.raw_cfg_file}",
+        "--output-file",
+        f"{args.protected_cfg_file}",
+    ]
+    result = await run_asyncio_subprocess(cmd, capture_stderr=True)
+    return result
+
+
+async def fw_update(args):
+    # Need abspath for local folder to mount as a Docker volume
+    fw_root = Path(args.fw_root).resolve()
+
+    make_dirs([fw_root])
+
+    cmd = [
+        "docker",
+        "run",
+        "-i",
+        "--add-host",
+        "saffire-net:host-gateway",
+        "-v",
+        f"{fw_root}:/firmware",
+        f"{args.sysname}/host_tools",
+        "/bin/bash",
+        "-c",
+        '"rm -rf /secrets; '
+        "/host_tools/fw_update "
+        f"--socket {args.uart_sock} "
+        f'--firmware-file {args.protected_fw_file}"',
+    ]
+    result = await run_asyncio_subprocess(cmd, capture_stderr=True)
+    return result
+
+
+async def cfg_load(args):
+    # Need abspath for local folder to mount as a Docker volume
+    cfg_root = Path(args.cfg_root).resolve()
+
+    make_dirs([cfg_root])
+
+    cmd = [
+        "docker",
+        "run",
+        "-i",
+        "--add-host",
+        "saffire-net:host-gateway",
+        "-v",
+        f"{cfg_root}:/configuration",
+        f"{args.sysname}/host_tools",
+        "/bin/bash",
+        "-c",
+        '"rm -rf /secrets ; '
+        "/host_tools/cfg_load "
+        f"--socket {args.uart_sock} "
+        f'--config-file {args.protected_cfg_file}"',
+    ]
+    result = await run_asyncio_subprocess(cmd, capture_stderr=True)
+    return result
+
+
+async def readback(args, rb_region):
+    # Get Docker-managed volumes
+    secrets_root = get_volume(args.sysname, "secrets")
+
+    cmd = [
+        "docker",
+        "run",
+        "-i",
+        "--add-host",
+        "saffire-net:host-gateway",
+        "-v",
+        f"{secrets_root}:/secrets",
+        f"{args.sysname}/host_tools",
+        "/host_tools/readback",
+        "--socket",
+        f"{args.uart_sock}",
+        "--region",
+        f"{rb_region}",
+        "--num-bytes",
+        f"{args.rb_len}",
+    ]
+    result = await run_asyncio_subprocess(cmd, capture_stdout=True, capture_stderr=True)
+    return result
+
+
+async def fw_readback(args):
+    return await readback(args, rb_region="firmware")
+
+
+async def cfg_readback(args):
+    return await readback(args, rb_region="configuration")
+
+
+async def boot(args):
+    # Get Docker-managed volumes
+    msg_root = get_volume(args.sysname, "messages")
+
+    cmd = [
+        "docker",
+        "run",
+        "-i",
+        "--add-host",
+        "saffire-net:host-gateway",
+        "-v",
+        f"{msg_root}:/messages",
+        f"{args.sysname}/host_tools",
+        "/bin/bash",
+        "-c",
+        '"rm -rf /secrets; '
+        "/host_tools/boot "
+        f"--socket {args.uart_sock} "
+        f'--release-message-file {args.boot_msg_file}\"',
+    ]
+    result = await run_asyncio_subprocess(cmd, capture_stderr=True)
+    return result
+
+
+async def monitor(args):
+    # Get Docker-managed volumes
+    msg_root = get_volume(args.sysname, "messages")
+
+    cmd = [
+        "docker",
+        "run",
+        "-i",
+        "--add-host",
+        "saffire-net:host-gateway",
+        "-v",
+        f"{msg_root}:/messages",
+        f"{args.sysname}/host_tools",
+        "/bin/bash",
+        "-c",
+        '"rm -rf /secrets ; '
+        "/host_tools/monitor "
+        f"--socket {args.uart_sock} "
+        f'--release-message-file {args.boot_msg_file}"',
+    ]
+    result = await run_asyncio_subprocess(cmd, capture_stderr=True)
+    return result
+
+
+def cleanup(args):
+    # Remove artifacts tied to the system name (if they exist)
+    if args.sysname is not None:
+        f_path = Path(f"{args.sysname}-bootloader.elf.deleteme")
+        if f_path.exists():
+            f_path.unlink()
+
+        f_path = Path(f"{args.sysname}-bl_image.bin.deleteme")
+        if f_path.exists():
+            f_path.unlink()
+
+    # Remove sockets
+    if args.sock_root is not None:
+        f_path = Path(args.sock_root)
+        clear_dir(args.sock_root)
+        if f_path.exists():
+            Path.rmdir(f_path)
+
+    log.info("Removed temporary files")
+
+
+def get_args():
+    parser = argparse.ArgumentParser(fromfile_prefix_chars="@")
+    subparsers = parser.add_subparsers(dest="cmd", help="sub-command help")
+    subparsers.required = True
+
+    parser_kill = subparsers.add_parser("kill-system", help="kill-system help")
+    parser_kill.add_argument("--sysname", required=True, help="SAFFIRe system name")
+    parser_kill.set_defaults(func=kill_system)
+
+    # Build SAFFIRe
+    parser_create = subparsers.add_parser("build-system", help="build-system help")
+    parser_create.add_argument(
+        "--sysname",
+        required=True,
+        help="SAFFIRe system name",
+    )
+    parser_create.add_argument(
+        "--root-path", default=ROOT_PATH, help="Path to top of repo to build"
+    )
+    parser_create.add_argument(
+        "--oldest-allowed-version",
+        required=True,
+        help="Oldest allowed firmware version on device",
+    )
+    parser_create.add_argument(
+        "--eeprom-secret",
+        default="Test EEPROM Secret",
+        help="Data to place at the end of EEPROM"
+    )
+    parser_create.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Force a full build of the host_tools docker image",
+    )
+    parser_create.add_argument(
+        "--base-image",
+        default="ectf/ectf-qemu",
+        help="Docker image name to use for the device images",
+    )
+    create_group = parser_create.add_mutually_exclusive_group(required=True)
+    create_group.add_argument(
+        "--physical",
+        action="store_true",
+        help="Run system for physical device",
+    )
+    create_group.add_argument(
+        "--emulated",
+        action="store_true",
+        help="Run system for emulated device",
+    )
+    parser_create.set_defaults(func=build_system)
+
+    # Load device with newest SAFFIRe bootloader
+    parser_load = subparsers.add_parser("load-device", help="load-device help")
+    parser_load.add_argument("--sysname", required=True, help="SAFFIRe system name")
+    parser_load.add_argument(
+        "--serial-port", default=None, help="Physical device serial port"
+    )
+    load_group = parser_load.add_mutually_exclusive_group(required=True)
+    load_group.add_argument(
+        "--physical",
+        action="store_true",
+        help="Run system for physical device",
+    )
+    load_group.add_argument(
+        "--emulated",
+        action="store_true",
+        help="Run system for emulated device",
+    )
+    parser_load.set_defaults(func=load_device)
+
+    # Run bootloader
+    parser_bl = subparsers.add_parser(
+        "launch-bootloader", help="launch-bootloader help"
+    )
+    parser_bl.add_argument("--sysname", required=True, help="SAFFIRe system name")
+    parser_bl.add_argument("--sock-root", help="Directory to place sockets")
+    parser_bl.add_argument("--uart-sock", required=True, help="UART interface socket")
+    parser_bl.add_argument("--serial-port", help="Physical device serial port")
+    bl_group = parser_bl.add_mutually_exclusive_group(required=True)
+    bl_group.add_argument(
+        "--physical",
+        action="store_true",
+        help="Run system for physical device",
+    )
+    bl_group.add_argument(
+        "--emulated",
+        action="store_true",
+        help="Run system for emulated device",
+    )
+    parser_bl.set_defaults(func=launch_bootloader)
+
+    # Run bootloader in interactive mode (emulated only)
+    parser_bl_i = subparsers.add_parser(
+        "launch-bootloader-interactive", help="launch-bootloader-interactive help"
+    )
+    parser_bl_i.add_argument("--sysname", required=True, help="SAFFIRe system name")
+    parser_bl_i.add_argument(
+        "--sock-root", required=True, help="Directory to place sockets"
+    )
+    parser_bl_i.add_argument("--uart-sock", required=True, help="UART interface socket")
+    parser_bl_i.set_defaults(func=launch_bootloader_interactive)
+
+    # Run bootloader with GDB (emulated only)
+    parser_bl_gdb = subparsers.add_parser(
+        "launch-bootloader-gdb", help="launch-bootloader-gdb help"
+    )
+    parser_bl_gdb.add_argument("--sysname", required=True, help="SAFFIRe system name")
+    parser_bl_gdb.add_argument(
+        "--sock-root", required=True, help="Directory to place sockets"
+    )
+    parser_bl_gdb.add_argument(
+        "--uart-sock", required=True, help="UART interface socket"
+    )
+    parser_bl_gdb.set_defaults(func=launch_bootloader_gdb)
+
+    # Run bootloader with side-channel emulator (emulated only)
+    parser_bl_sc = subparsers.add_parser(
+        "launch-bootloader-sc", help="launch-bootloader-sc help"
+    )
+    parser_bl_sc.add_argument("--sysname", required=True, help="SAFFIRe system name")
+    parser_bl_sc.add_argument(
+        "--sock-root", required=True, help="Directory to place sockets"
+    )
+    parser_bl_sc.add_argument(
+        "--uart-sock", required=True, help="UART interface socket"
+    )
+    parser_bl_sc.set_defaults(func=launch_bootloader_sc)
+
+    # Firmware protect
+    parser_fw_protect = subparsers.add_parser("fw-protect", help="fw-protect help")
+    parser_fw_protect.add_argument(
+        "--sysname", required=True, help="SAFFIRe system name"
+    )
+    parser_fw_protect.add_argument(
+        "--fw-root", required=True, help="Directory to read and save firmware images"
+    )
+    parser_fw_protect.add_argument(
+        "--raw-fw-file", required=True, help="Firmware protect input file"
+    )
+    parser_fw_protect.add_argument(
+        "--protected-fw-file", required=True, help="Firmware protect output file"
+    )
+    parser_fw_protect.add_argument(
+        "--fw-version", required=True, help="Firmware protect version"
+    )
+    parser_fw_protect.add_argument(
+        "--fw-message", required=True, help="Firmware protect release message"
+    )
+    parser_fw_protect.set_defaults(func=fw_protect)
+
+    # Configuration protect
+    parser_cfg_protect = subparsers.add_parser("cfg-protect", help="cfg-protect help")
+    parser_cfg_protect.add_argument(
+        "--sysname", required=True, help="SAFFIRe system name"
+    )
+    parser_cfg_protect.add_argument(
+        "--cfg-root",
+        required=True,
+        help="Directory to read and save configuration images",
+    )
+    parser_cfg_protect.add_argument(
+        "--raw-cfg-file", required=True, help="Configuration protect input file"
+    )
+    parser_cfg_protect.add_argument(
+        "--protected-cfg-file", required=True, help="Configuration protect output file"
+    )
+    parser_cfg_protect.set_defaults(func=cfg_protect)
+
+    # Firmware update
+    parser_fw_update = subparsers.add_parser("fw-update", help="fw-update help")
+    parser_fw_update.add_argument(
+        "--sysname", required=True, help="SAFFIRe system name"
+    )
+    parser_fw_update.add_argument(
+        "--fw-root", required=True, help="Directory to read firmware images"
+    )
+    parser_fw_update.add_argument(
+        "--uart-sock", required=True, help="UART interface socket"
+    )
+    parser_fw_update.add_argument(
+        "--protected-fw-file", required=True, help="Firmware update input file"
+    )
+    parser_fw_update.set_defaults(func=fw_update)
+
+    # Load configuration
+    parser_cfg_load = subparsers.add_parser("cfg-load", help="cfg-load help")
+    parser_cfg_load.add_argument("--sysname", required=True, help="SAFFIRe system name")
+    parser_cfg_load.add_argument(
+        "--cfg-root", required=True, help="Directory to read configuration images"
+    )
+    parser_cfg_load.add_argument(
+        "--uart-sock", required=True, help="UART interface socket"
+    )
+    parser_cfg_load.add_argument(
+        "--protected-cfg-file", required=True, help="Configuration load input file"
+    )
+    parser_cfg_load.set_defaults(func=cfg_load)
+
+    # Firmware readback
+    parser_fw_readback = subparsers.add_parser("fw-readback", help="fw-readback help")
+    parser_fw_readback.add_argument(
+        "--sysname", required=True, help="SAFFIRe system name"
+    )
+    parser_fw_readback.add_argument(
+        "--uart-sock", required=True, help="UART interface socket"
+    )
+    parser_fw_readback.add_argument(
+        "--rb-len", required=True, help="Readback request data length"
+    )
+    parser_fw_readback.set_defaults(func=fw_readback)
+
+    # Configuration readback
+    parser_cfg_readback = subparsers.add_parser(
+        "cfg-readback", help="cfg-readback help"
+    )
+    parser_cfg_readback.add_argument(
+        "--sysname", required=True, help="SAFFIRe system name"
+    )
+    parser_cfg_readback.add_argument(
+        "--uart-sock", required=True, help="UART interface socket"
+    )
+    parser_cfg_readback.add_argument(
+        "--rb-len", required=True, help="Readback request data length"
+    )
+    parser_cfg_readback.set_defaults(func=cfg_readback)
+
+    # Device boot
+    parser_boot = subparsers.add_parser("boot", help="boot help")
+    parser_boot.add_argument("--sysname", required=True, help="SAFFIRe system name")
+    parser_boot.add_argument("--uart-sock", required=True, help="UART interface socket")
+    parser_boot.add_argument(
+        "--boot-msg-file",
+        required=True,
+        help="File path for host to store booted release message in",
+    )
+    parser_boot.set_defaults(func=boot)
+
+    # Firmware monitor
+    parser_monitor = subparsers.add_parser("monitor", help="monitor help")
+    parser_monitor.add_argument("--sysname", required=True, help="SAFFIRe system name")
+    parser_monitor.add_argument(
+        "--uart-sock", required=True, help="UART interface socket"
+    )
+    parser_monitor.add_argument(
+        "--boot-msg-file",
+        required=True,
+        help="File path for host to read booted release messages from",
+    )
+    parser_monitor.set_defaults(func=monitor)
+
+    # Delete messages
+    parser_delmsg = subparsers.add_parser("delete-message", help="delete-release-message help")
+    parser_delmsg.add_argument("--sysname", required=True, help="SAFFIRe system name")
+    parser_delmsg.add_argument(
+        "--boot-msg-file",
+        required=True,
+        help="File name of existing release message to delete",
+    )
+    parser_delmsg.set_defaults(func=delete_release_message)
+
+    # Print release message
+    parser_printmsg = subparsers.add_parser("print-message", help="print-message help")
+    parser_printmsg.add_argument("--sysname", required=True, help="SAFFIRe system name")
+    parser_printmsg.add_argument(
+        "--boot-msg-file",
+        required=True,
+        help="File name to read booted release message from",
+    )
+    parser_printmsg.set_defaults(func=get_release_message)
+
+    # Clean up temporary files
+    parser_cleanup = subparsers.add_parser("cleanup", help="cleanup help")
+    parser_cleanup.add_argument("--sysname", help="SAFFIRe system name")
+    parser_cleanup.add_argument("--sock-root", help="Emulated bootloader socket dir")
+    parser_cleanup.set_defaults(func=cleanup)
+
+    args, unknown = parser.parse_known_args()
+
+    return args
+
+
+def main():
+    # configure logging
+    # this should be here so that logging is only configured when this file is
+    # run as a script. if imported from another module, we don't want to
+    # reconfigure logging
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s:%(name)-18s%(levelname)-8s %(message)s"
+    )
+
+    # Get args and call specified function
+    args = get_args()
+
+    # If not a coroutine, run without asyncio
+    if inspect.iscoroutinefunction(args.func):
+        asyncio.run(args.func(args))
+    else:
+        args.func(args)
+
+
+if __name__ == "__main__":
+    main()

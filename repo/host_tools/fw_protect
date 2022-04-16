@@ -1,0 +1,132 @@
+#!/usr/bin/python3 -u
+
+# 2022 eCTF
+# Protect Firmware Tool
+# Kyle Scaplen
+#
+# (c) 2022 The MITRE Corporation
+#
+# This source file is part of an example system for MITRE's 2022 Embedded System
+# CTF (eCTF). This code is being provided only for educational purposes for the
+# 2022 MITRE eCTF competition, and may not meet MITRE standards for quality.
+# Use this code at your own risk!
+
+import argparse
+import json
+import logging
+import struct
+from pathlib import Path
+from typing import Dict
+
+
+from util import (
+    print_banner,
+    FIRMWARE_ROOT,
+    LOG_FORMAT,
+    MAX_FIRMWARE_SIZE,
+    MAX_RELEASE_MSG_SIZE,
+)
+from crypto import encrypt, get_mac
+
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+log = logging.getLogger(Path(__file__).name)
+
+
+def pack_and_enc_data(version: int, release_message: str, firmware_data: bytes) -> Dict:
+    """
+    The AD will be structured in a manner that will be recreated in the device
+    after receiving the data (in the exact same form and layout).
+    It will then be checked together with the encrypted firmware for integrity.
+
+    In this case, only the firmware is encrypted while its metadata is sent in plaintext.
+    """
+
+    firmware_size = len(firmware_data)
+
+    # Sanity checks:
+    if len(release_message) > MAX_RELEASE_MSG_SIZE:
+        log.warning("Release message should be between 0 and 1024 bytes")
+        exit(1)
+    elif firmware_size > MAX_FIRMWARE_SIZE:
+        log.warning("Firmware is too large!")
+        exit(1)
+    elif version < 0 or version > 0xFFFF:
+        log.warning("Invalid version number")
+        exit(1)
+
+    log.info("Creating the AD...")
+    AD = struct.pack(">HI", version, firmware_size) + release_message.encode() + b"\x00"
+
+    log.info("Encrypting the data...")
+
+    ctx = encrypt(firmware_data, AD=AD)
+
+    if not ctx:
+        log.warn("Encryption failed. Exiting..")
+        exit(1)
+
+    log.info("Generate MAC for the firmware...")
+    firmware_mac = get_mac(firmware_data)
+
+    # Create firmware storage structure
+    log.info("Packaging the firmware...")
+
+    # Construct the metadata
+    data = {
+        "firmware_size": firmware_size,
+        "version_num": version,
+        "release_msg": release_message,
+        "firmware": ctx.hex(),
+        "mac": firmware_mac.hex(),
+    }
+
+    return data
+
+
+def protect_firmware(
+    firmware_file: Path, version: int, release_message: str, protected_firmware: Path
+):
+    print_banner("SAFFIRe Firmware Protect Tool")
+
+    # Read in the raw firmware binary
+    log.info("Reading the firmware...")
+    firmware_data = firmware_file.read_bytes()
+
+    data = pack_and_enc_data(version, release_message, firmware_data)
+
+    # Write to the output file
+    with protected_firmware.open("w", encoding="utf8") as fd:
+        json.dump(data, fd)
+
+    log.info("Firmware protected\n")
+
+
+def main():
+    # get arguments
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--firmware", help="The name of the firmware image to protect.", required=True
+    )
+    parser.add_argument(
+        "--version", help="The version of this firmware.", type=int, required=True
+    )
+    parser.add_argument(
+        "--release-message", help="The release message of this firmware.", required=True
+    )
+    parser.add_argument(
+        "--output-file", help="The name of the protected firmware image.", required=True
+    )
+
+    args = parser.parse_args()
+
+    # process command
+    firmware_file = FIRMWARE_ROOT / args.firmware
+    protected_firmware = FIRMWARE_ROOT / args.output_file
+    protect_firmware(
+        firmware_file, args.version, args.release_message, protected_firmware
+    )
+
+
+if __name__ == "__main__":
+    main()

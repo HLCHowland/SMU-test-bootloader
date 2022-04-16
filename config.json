@@ -1,0 +1,8 @@
+{
+    "name": "smu",
+    "sock_root": "/socks/smu",
+    "uart_sock": 1370,
+    "restart_sock": "restart.sock",
+    "sc_probe_sock": "sc_probe.sock",
+    "oldest_allowed_version": 2
+}

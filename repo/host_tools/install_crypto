@@ -1,0 +1,4 @@
+#!/bin/sh
+
+# Install for host tools
+python3 -m pip install pymonocypher
